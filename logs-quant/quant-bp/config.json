@@ -1,0 +1,29 @@
+{
+  "script": "/root/noise/train/val/run_quant_bp.py",
+  "preset": "38m",
+  "model": {
+    "n_layer": 8,
+    "n_head": 8,
+    "n_kv_head": 8,
+    "n_embd": 512,
+    "sequence_len": 2048,
+    "quant_mode": "qat"
+  },
+  "seed": 0,
+  "estimator": "backprop",
+  "sr": false,
+  "batch": 8,
+  "train_rows": 4880,
+  "recipe": {
+    "lr": 0.003,
+    "betas": [
+      0.7,
+      0.95
+    ],
+    "warmdown": 0.3,
+    "anvil_lr": 0.023,
+    "anvil_wd": 2.25
+  },
+  "fake_data": false,
+  "torch_version": "2.10.0+cu128"
+}

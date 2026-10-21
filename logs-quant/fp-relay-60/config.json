@@ -1,0 +1,59 @@
+{
+  "script": "/root/noise/train/val/run_relay.py",
+  "world": 1,
+  "preset": "38m",
+  "model": {
+    "sequence_len": 2048,
+    "vocab_size": 4096,
+    "n_layer": 8,
+    "n_head": 8,
+    "n_kv_head": 8,
+    "n_embd": 512,
+    "window_pattern": "SSSL",
+    "mlp_mult": 4
+  },
+  "seed": 0,
+  "estimator": "relay",
+  "switch": 0.0,
+  "boost_steps": 0,
+  "cut_steps": 60,
+  "boost_batch": 4,
+  "cut_batch": 8,
+  "train_file": "train.pt",
+  "train_rows": 4880,
+  "recipe": {
+    "lr": 0.003,
+    "betas": [
+      0.7,
+      0.95
+    ],
+    "warmdown": 0.3,
+    "anvil_lr": 0.023,
+    "anvil_wd": 2.25
+  },
+  "settings": {
+    "sigma": 0.005,
+    "probes": 0,
+    "fc_k": 256,
+    "fc_sigma": 0.05,
+    "local": {
+      "q": 64,
+      "k": 320,
+      "v": 512,
+      "gate": 64
+    },
+    "nrep": 64,
+    "emb_chunk": 16,
+    "scalar_step": 0.01,
+    "chunk": 134217728,
+    "boost_exact_keys": true,
+    "chain_sigma": 0.01,
+    "route_k": 512,
+    "chain_tokens": 64,
+    "cut_exact_keys": true,
+    "key_sigma": 0.003,
+    "key_chunk": 8
+  },
+  "polar_margin": 1.1,
+  "torch_version": "2.10.0+cu128"
+}

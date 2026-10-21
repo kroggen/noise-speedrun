@@ -68,8 +68,14 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+CUDA = torch.cuda.is_available()
+
+if os.environ.get('NO_COMPILE'):  # smoke tests on CPU: eager mode (must precede utils.model's flex compile)
+    torch.compile = lambda fn=None, **kw: fn if callable(fn) else (lambda f: f)
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from utils.model import GPT, GPTConfig, apply_rotary_emb, attention, flex, has_ve, norm, window_mask  # noqa: E402
+from utils.model import flex, window_mask  # noqa: E402  (the unused estimators' paths)
+from utils.model_quant import GPT, GPTConfig, apply_quant, apply_rotary_emb, attention, has_ve, norm  # noqa: E402
 from utils.prepare_data import SEQ, TRAIN_ROWS, VAL_ROWS  # noqa: E402
 
 SEED = 0
@@ -111,6 +117,8 @@ class Settings:
     cut_exact_keys: bool = True
     key_sigma: float = 0.003
     key_chunk: int = 8
+    # Relay on the int8-weight model
+    stochastic: bool = False    # stochastic rounding when re-snapping the lattice
 
 
 # ---------------------------------------------------------------------------------------------------------- helpers
@@ -372,7 +380,8 @@ class Capture:
         self.generator = torch.Generator(self.device).manual_seed(seed + 3 + 7777 * rank)
         self.shared_generator = torch.Generator(self.device).manual_seed(seed + 5)
         self.frames = {}
-        self.modules = {n: m for n, m in model.named_modules() if isinstance(m, (nn.Linear, nn.Embedding))}
+        self.modules = {n: m for n, m in model.named_modules()
+                        if isinstance(m, (nn.Linear, nn.Embedding)) or hasattr(m, 'shadow')}
         self.inputs, self.outputs, self.blocks = {}, {}, {}
         self.capturing = False
         self.hooks = [m.register_forward_hook(self.output_hook(n)) for n, m in self.modules.items()]
@@ -421,11 +430,17 @@ class Capture:
         self.frames.clear()
         self.capturing = True
         try:
-            with torch.autocast('cuda', dtype=self.dtype):
+            if CUDA:
+                with torch.autocast('cuda', dtype=self.dtype):
+                    self.clean_loss = self.model(x, y, loss_reduction='none').view_as(y).float()
+            else:
                 self.clean_loss = self.model(x, y, loss_reduction='none').view_as(y).float()
         finally:
             self.capturing = False
-        with torch.autocast('cuda', dtype=self.dtype):
+        if CUDA:
+            with torch.autocast('cuda', dtype=self.dtype):
+                self.x0 = norm(self.outputs['transformer.wte'])
+        else:
             self.x0 = norm(self.outputs['transformer.wte'])
 
     def head_error(self, sigma=0.1):
@@ -436,7 +451,7 @@ class Capture:
     def reassemble(self, site, error):
         """Weight gradient from output error and cached input."""
         x, module = self.inputs[site], self.modules[site]
-        if isinstance(module, nn.Embedding):
+        if isinstance(module, nn.Embedding) or getattr(module, 'is_embedding', False):
             weight_error = torch.zeros_like(module.weight, dtype=torch.float32)
             return weight_error.index_add_(0, x.reshape(-1), error.reshape(-1, error.shape[-1]))
         return torch.einsum('btd,bti->di', error, x)
@@ -1136,6 +1151,41 @@ class Relay(CutBI):
     tokens = 256
     key_block = 512
 
+    def __init__(self, model, settings, seed, rank, world):
+        super().__init__(model, settings, seed, rank, world)
+        shadows = set()
+        self.params = []  # (gradient key, target parameter): quantized modules by shadow, the rest direct
+        for name, module in model.named_modules():
+            if hasattr(module, 'shadow'):
+                self.params.append((name + '.weight', module.shadow))
+                shadows.add(id(module.shadow))
+        for name, p in model.named_parameters():
+            if id(p) not in shadows:
+                self.params.append((name, p))
+
+    def step(self, x, y, optimizer):
+        """Measure, write dL/dW_eff into the shadow latents (and the float params directly), step, and
+        re-snap the int8 lattice."""
+        gradients = self.estimate(x, y)
+        valid = (y != -1).sum()
+        optimizer.zero_grad(set_to_none=True)
+        parts, grads = [], []
+        for key, p in self.params:
+            g = gradients.get(key)
+            g = torch.zeros_like(p, dtype=torch.float32) if g is None else (g / valid).float()
+            parts.append(g.reshape(-1))
+            grads.append((p, g))
+        flat = torch.cat(parts)
+        if self.world > 1:
+            torch.distributed.all_reduce(flat)
+        if not bool(torch.isfinite(flat).all()):
+            raise FloatingPointError('Non-finite estimate')
+        for p, g in grads:
+            p.grad = g.view_as(p).to(p.dtype)
+        optimizer.step()
+        apply_quant(self.model, self.s.stochastic)  # the latents land back on the int8 lattice
+        return average_ranks(self.capture.clean_loss[y != -1].mean().reshape(1)).item()
+
     def cycle(self, fn, x, per_token, shared=()):
         """A full sign-flipped Hadamard cycle of moves of x (n, W), each scored by fn: the measured credit of x."""
         H = self.basis()
@@ -1282,15 +1332,14 @@ class DFA(Cut):
 
 def make_model(device, seed, config):
     torch.manual_seed(seed)
-    with torch.device('meta'):
-        model = GPT(config)
-    model.to_empty(device=device)
+    model = GPT(config).to(device)
     model.init_weights()
     with torch.no_grad():  # output projections: uniform with std 1.5 / sqrt(fan_in) instead of zeros (the record's)
         for name, module in model.named_modules():
-            if 'c_proj' in name and isinstance(module, nn.Linear):
-                scale = 1.5 * math.sqrt(3 / module.weight.shape[1])
-                nn.init.uniform_(module.weight, -scale, scale)
+            if 'c_proj' in name and hasattr(module, 'shadow'):
+                scale = 1.5 * math.sqrt(3 / module.shadow.shape[1])
+                nn.init.uniform_(module.shadow, -scale, scale)
+                module.refresh(False)
     return model.requires_grad_(False)
 
 
@@ -1398,7 +1447,10 @@ def evaluate(model, rows, batch_size=16):
     total = torch.zeros(2, dtype=torch.float64, device=device)
     for batch in rows[rank::world].split(batch_size):
         batch = batch.to(device)
-        with torch.autocast('cuda', dtype=torch.bfloat16):
+        if CUDA:
+            with torch.autocast('cuda', dtype=torch.bfloat16):
+                loss = model(batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), loss_reduction='sum')
+        else:
             loss = model(batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), loss_reduction='sum')
         total[0] += loss.double()
         total[1] += batch[:, 1:].numel()
@@ -1411,6 +1463,12 @@ def load_split(path, rows=None):
     data = torch.load(path, map_location='cpu', weights_only=True).long()
     assert data.shape[1] == SEQ and (rows is None or data.shape[0] >= rows), (path, tuple(data.shape))
     return data if rows is None else data[:rows]
+
+
+def fake_data(config, rows, seq_len, seed):
+    """Random tokens, for smoke tests only."""
+    g = torch.Generator().manual_seed(seed + 7)
+    return torch.randint(0, config.vocab_size, (rows, seq_len + 1), generator=g)
 
 
 # ------------------------------------------------------------------------------------------------------------ train
@@ -1442,23 +1500,32 @@ def main():
     parser.add_argument('--steps', type=int, default=0, help='Smoke test: stop after this many updates.')
     parser.add_argument('--save-every', type=int, default=0, help='Save the weights every this many sequences '
                         '(analysis: credit structure along training).')
+    parser.add_argument('--mode', choices=('qat', 'int'), default='qat',
+                        help='qat: dequantized matmuls; int: int8 activations + integer GEMMs.')
+    parser.add_argument('--sr', action='store_true', help='Stochastic rounding when re-snapping the lattice.')
+    parser.add_argument('--seq-len', type=int, default=2048, help='Model sequence length (fake data only).')
+    parser.add_argument('--fake-data', action='store_true', help='Random tokens, for smoke tests.')
+    parser.add_argument('--cpu', action='store_true', help='Run on CPU (smoke tests; disables compile).')
     args = parser.parse_args()
 
     rank, world = int(os.environ.get('RANK', 0)), int(os.environ.get('WORLD_SIZE', 1))
-    device = torch.device('cuda', int(os.environ.get('LOCAL_RANK', 0)))
-    torch.cuda.set_device(device)
+    device = torch.device('cpu') if args.cpu else torch.device('cuda', int(os.environ.get('LOCAL_RANK', 0)))
+    if not args.cpu:
+        torch.cuda.set_device(device)
     torch.set_float32_matmul_precision('high')
     if world > 1:
         torch.distributed.init_process_group('nccl', device_id=device)
     n_layer, WIDTH = PRESETS[args.preset]
     HIDDEN = 4 * WIDTH
-    config = GPTConfig(n_layer=n_layer, n_head=WIDTH // 64, n_kv_head=WIDTH // 64, n_embd=WIDTH)
+    config = GPTConfig(n_layer=n_layer, n_head=WIDTH // 64, n_kv_head=WIDTH // 64, n_embd=WIDTH,
+                       sequence_len=args.seq_len, quant_mode=args.mode)
     recipe = Recipe()
     relay = args.estimator == 'relay'
     if args.switch is None:
         args.switch = 0.0 if relay else 0.3
     settings = Settings(fc_k=HIDDEN // 8, route_k=args.route_k or (HIDDEN // 4 if relay else HIDDEN // 16),
-                        cut_exact_keys=args.keys == 'exact', boost_exact_keys=args.boost_keys == 'exact')
+                        cut_exact_keys=args.keys == 'exact', boost_exact_keys=args.boost_keys == 'exact',
+                        stochastic=args.sr)
     if args.boost_probes:
         settings.probes = args.boost_probes
     if args.chain_tokens:
@@ -1475,9 +1542,13 @@ def main():
         groups = [torch.distributed.new_group(list(range(g * split, (g + 1) * split))) for g in range(world // split)]
     group = groups[rank // split] if split > 1 else None
 
-    training = load_split(args.data_dir / args.train_file, args.train_rows)
+    if args.fake_data:
+        training = fake_data(config, max(args.train_rows, batch2 * 4), args.seq_len, args.seed)
+        val_rows = fake_data(config, 8, args.seq_len, args.seed + 1)
+    else:
+        training = load_split(args.data_dir / args.train_file, args.train_rows)
+        val_rows = load_split(args.data_dir / 'val.pt', VAL_ROWS)
     training = training[torch.randperm(len(training), generator=torch.Generator().manual_seed(SEED + 1))]
-    val_rows = load_split(args.data_dir / 'val.pt', VAL_ROWS)
     steps1, steps2 = len(training) // batch1, len(training) // batch2
     n1 = round(args.switch * steps1) // 2 * 2  # Boost updates, ending on a phase-2 batch boundary
     j0 = n1 * batch1 // batch2
@@ -1491,7 +1562,7 @@ def main():
         args.output.mkdir(parents=True, exist_ok=True)
         (args.output / 'config.json').write_text(json.dumps(dict(
             script=__file__, world=world, preset=args.preset, model=asdict(config), seed=args.seed,
-            estimator=args.estimator,
+            estimator=args.estimator, mode=args.mode, sr=args.sr, fake_data=args.fake_data,
             switch=args.switch, boost_steps=n1, cut_steps=last - j0, boost_batch=batch1, cut_batch=batch2,
             train_file=args.train_file, train_rows=len(training), recipe=asdict(recipe), settings=asdict(settings),
             polar_margin=POLAR_MARGIN, torch_version=torch.__version__,
@@ -1502,7 +1573,8 @@ def main():
         return model, make_optimizer(model, recipe, steps1), Boost(model, settings, args.seed, rank, world, split, group)
 
     # untimed warmup on random tokens (compilation of both phases), then training from a fresh model
-    noise = torch.randint(0, config.vocab_size, (batch2, SEQ), generator=torch.Generator().manual_seed(SEED)).to(device)
+    noise = torch.randint(0, config.vocab_size, (batch2, args.seq_len + 1),
+                          generator=torch.Generator().manual_seed(SEED)).to(device)
     if n1:
         model, optimizer, estimator = boost_init()
         first = (rank // split) * per1
@@ -1514,17 +1586,19 @@ def main():
     Phase2 = dict(relay=Relay, cut=Cut, cutbi=CutBI, dfa=DFA)[args.estimator]
     estimator = Phase2(model, settings, args.seed, rank, world)
     mine = slice(rank * per2, (rank + 1) * per2)
-    estimator.step(noise[mine, :-1].contiguous(), noise[mine, 1:].contiguous(), optimizer)
-    estimator.close()
-    del model, optimizer, estimator
-    torch.cuda.empty_cache()
+    if not args.cpu:  # untimed warmup on random tokens (compilation), then training from a fresh state
+        estimator.step(noise[mine, :-1].contiguous(), noise[mine, 1:].contiguous(), optimizer)
+        estimator.close()
+        del model, optimizer, estimator
+        torch.cuda.empty_cache()
     model, optimizer, estimator = boost_init()
 
     if rank == 0:
         print(f'boostcut {args.preset}: Boost {n1} steps at batch {batch1}, Cut {last - j0} steps at batch {batch2}',
               flush=True)
     log = (args.output / 'metrics.jsonl').open('a') if rank == 0 else None
-    torch.cuda.synchronize()
+    if not args.cpu:
+        torch.cuda.synchronize()
     start, paused, elapsed = time.perf_counter(), 0.0, 0.0
 
     def set_rate(step, steps):
@@ -1535,7 +1609,8 @@ def main():
 
     def after(phase, step, seqs, loss):
         nonlocal paused, elapsed
-        torch.cuda.synchronize()
+        if not args.cpu:
+            torch.cuda.synchronize()
         elapsed = time.perf_counter() - start - paused
         record = dict(phase=phase, step=step, seqs=seqs, train_loss=loss, train_seconds=round(elapsed, 2))
         if args.eval_every and seqs % args.eval_every == 0 and seqs < len(training):

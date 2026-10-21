@@ -1,0 +1,9 @@
+{
+  "val_loss": 3.700675368309021,
+  "train_seconds": 37.39,
+  "steps": 610,
+  "batch": 8,
+  "mode": "qat-bp",
+  "sr": false,
+  "tokens": 9989360
+}
