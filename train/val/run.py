@@ -68,8 +68,14 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+CUDA = torch.cuda.is_available()
+
+if os.environ.get('NO_COMPILE'):  # smoke tests on CPU: eager mode (must precede utils.model's flex compile)
+    torch.compile = lambda fn=None, **kw: fn if callable(fn) else (lambda f: f)
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from utils.model import GPT, GPTConfig, apply_rotary_emb, attention, flex, has_ve, norm, window_mask  # noqa: E402
+from utils.model import attention, flex, window_mask  # noqa: E402  (the unused estimators' paths)
+from utils.model_hardk import GPT, GPTConfig, apply_rotary_emb, has_ve, norm, window_allowed  # noqa: E402
 from utils.prepare_data import SEQ, TRAIN_ROWS, VAL_ROWS  # noqa: E402
 
 SEED = 0
@@ -111,6 +117,9 @@ class Settings:
     cut_exact_keys: bool = True
     key_sigma: float = 0.003
     key_chunk: int = 8
+    # Relay on the hard model (hard top-k attention + hard gates)
+    swap: bool = True           # query/key credit by swap regret (False: attention internals frozen)
+    margin_floor: float = 0.1   # clamp on the score gap a swap must close (gain/margin weighting)
 
 
 # ---------------------------------------------------------------------------------------------------------- helpers
@@ -420,12 +429,22 @@ class Capture:
         self.batch, self.length = x.shape
         self.frames.clear()
         self.capturing = True
+        for block in self.model.transformer.h:  # record each layer's exact hard-attention selection
+            block.attn.record_selection = True
         try:
-            with torch.autocast('cuda', dtype=self.dtype):
+            if CUDA:
+                with torch.autocast('cuda', dtype=self.dtype):
+                    self.clean_loss = self.model(x, y, loss_reduction='none').view_as(y).float()
+            else:
                 self.clean_loss = self.model(x, y, loss_reduction='none').view_as(y).float()
         finally:
             self.capturing = False
-        with torch.autocast('cuda', dtype=self.dtype):
+            for block in self.model.transformer.h:
+                block.attn.record_selection = False
+        if CUDA:
+            with torch.autocast('cuda', dtype=self.dtype):
+                self.x0 = norm(self.outputs['transformer.wte'])
+        else:
             self.x0 = norm(self.outputs['transformer.wte'])
 
     def head_error(self, sigma=0.1):
@@ -815,7 +834,12 @@ class Boost:
         optimizer.zero_grad(set_to_none=True)
         sequences = self.world // self.split
         params = list(self.model.named_parameters())
-        flat = torch.cat([(gradients[name] / valid).float().reshape(-1) for name, _ in params])
+        parts = []
+        for name, p in params:
+            g = gradients[name]
+            parts.append(torch.zeros_like(p, dtype=torch.float32).reshape(-1) if g is None
+                         else (g / valid).float().reshape(-1))
+        flat = torch.cat(parts)
         if self.world > 1:
             torch.distributed.all_reduce(flat)
         flat /= sequences
@@ -823,8 +847,12 @@ class Boost:
             raise FloatingPointError('Non-finite estimate')
         offset = 0
         for name, p in params:
-            p.grad = flat[offset:offset + p.numel()].view_as(p).to(p.dtype)
-            offset += p.numel()
+            n = p.numel()
+            if gradients[name] is None:
+                p.grad = None  # frozen: the optimizers skip it
+            else:
+                p.grad = flat[offset:offset + n].view_as(p).to(p.dtype)
+            offset += n
         optimizer.step()
         return average_ranks(self.capture.clean_loss[y != -1].mean().reshape(1)).item()
 
@@ -1136,6 +1164,100 @@ class Relay(CutBI):
     tokens = 256
     key_block = 512
 
+    def layer_internals(self, i, target, gradients):
+        """Layer i's value, gate, value-embedding, query and key gradients, one local step from its
+        attention-output credit target (b, t, W). Returns the credit u (b*t, W) of the layer's normed
+        input stream through its attention: the value and gate paths only (with the selection fixed the
+        attention output does not depend on the scores or the gate logits)."""
+        d, s, model = self.capture, self.s, self.model
+        cfg = model.config
+        b, t = d.batch, d.length
+        h, hd = cfg.n_head, cfg.n_embd // cfg.n_head
+        L = cfg.n_layer
+        prefix = f'transformer.h.{i}.attn.'
+        cos, sin = model.cos[0, :t, 0].float(), model.sin[0, :t, 0].float()
+
+        def rot(z):
+            x1, x2 = z[..., :hd // 2], z[..., hd // 2:]
+            return torch.cat([x1 * cos + x2 * sin, x1 * -sin + x2 * cos], -1)
+
+        def rot_inv(z):  # the rotary map is orthogonal; its inverse rotates the other way
+            x1, x2 = z[..., :hd // 2], z[..., hd // 2:]
+            return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], -1)
+
+        e_v = torch.zeros(b, t, cfg.n_embd, device=self.device)
+        e_gate = torch.zeros(b, t, h, device=self.device) if has_ve(i, L) else None
+        ve_error = torch.zeros(b, t, cfg.n_embd, device=self.device) if has_ve(i, L) else None
+        e_q = torch.zeros(b, t, cfg.n_embd, device=self.device)
+        e_k = torch.zeros(b, t, cfg.n_embd, device=self.device)
+        allowed = window_allowed(t, model.window_sizes[i][0], self.device)[None]
+        for r in range(b):
+            heads = lambda name: d.outputs[prefix + name][r].float().view(t, h, hd).permute(1, 0, 2)
+            q_raw, k_raw, v_raw = heads('c_q'), heads('c_k'), heads('c_v')
+            if has_ve(i, L):
+                ve = d.outputs[f'value_embeds.{i}'][r].float().view(t, h, hd).permute(1, 0, 2)
+                gz = d.outputs[prefix + 've_gate'][r].float().view(t, h).permute(1, 0)
+                gate = 2.0 * (gz > 0).float()
+                values = v_raw + gate.unsqueeze(-1) * ve
+            else:
+                gate, values = None, v_raw
+            indices, valid, count = model.transformer.h[i].attn.last_selection
+            idx, val = indices[r].to(self.device), valid[r].to(self.device)
+            cnt = count[r].float().to(self.device)
+            hub = target[r].view(t, h, hd).permute(1, 0, 2)  # (h, t, hd) the attention-output credit
+            # the value credit: A^T times the target, A the recorded 1/count selection matrix
+            A = torch.zeros(h, t, t, device=self.device)
+            A.scatter_(-1, idx, torch.where(val, cnt.reciprocal().unsqueeze(-1), torch.zeros((), device=self.device)))
+            credit = torch.bmm(A.transpose(1, 2), hub)  # (h, t, hd)
+            e_v[r] = credit.permute(1, 0, 2).reshape(t, cfg.n_embd)
+            if has_ve(i, L):
+                e_gate[r] = (ve * credit).sum(-1).permute(1, 0)          # the step's flip gain per unit gate
+                ve_error[r] = (credit * gate.unsqueeze(-1)).permute(1, 0, 2).reshape(t, cfg.n_embd)
+            # the queries and keys: swap regret (the scores are flat a.e.; the output ignores their values)
+            if s.swap:
+                q_rot, k_rot = rot(q_raw), rot(k_raw)
+                rq = q_rot.square().mean(-1, keepdim=True).sqrt()
+                rk = k_rot.square().mean(-1, keepdim=True).sqrt()
+                qp, kp = q_rot / rq, k_rot / rk
+                logits = (qp @ kp.transpose(1, 2)) / hd ** 0.5
+                sel = torch.zeros(h, t, t, dtype=torch.bool, device=self.device).scatter(-1, idx, val)
+                # the credit value of key j to query s: <hub_s, v_j> / count_s (what swapping j in would pay)
+                contrib = torch.bmm(hub, values.transpose(1, 2)) / cnt.unsqueeze(-1)
+                c_in, i_in = contrib.masked_fill(sel | ~allowed, float('inf')).min(-1)
+                c_out, i_out = contrib.masked_fill(~sel, float('-inf')).max(-1)
+                gain = c_out - c_in  # > 0: swapping i_out for i_in lowers the loss by gain (first order)
+                margin = (logits.gather(-1, i_out.unsqueeze(-1)) -
+                          logits.gather(-1, i_in.unsqueeze(-1))).squeeze(-1).clamp(min=s.margin_floor)
+                w = torch.where(gain > 0, gain / margin, torch.zeros((), device=self.device))  # (h, s)
+                gather_keys = lambda jj: kp.gather(1, jj.unsqueeze(-1).expand(-1, -1, hd))
+                dq = (gather_keys(i_in) - gather_keys(i_out)) * w.unsqueeze(-1)  # (h, s, hd), the normed space
+                dq = rot_inv(dq * rq)                                            # through the norm's pseudo-inverse
+                e_q[r] = dq.permute(1, 0, 2).reshape(t, cfg.n_embd)
+                dk = torch.zeros(h, t, hd, device=self.device)
+                wpq = qp * w.unsqueeze(-1)
+                dk.scatter_add_(1, i_in.unsqueeze(-1).expand(-1, -1, hd), wpq)
+                dk.scatter_add_(1, i_out.unsqueeze(-1).expand(-1, -1, hd), -wpq)
+                e_k[r] = rot_inv(dk * rk).permute(1, 0, 2).reshape(t, cfg.n_embd)
+        errors = {prefix + 'c_v': e_v, prefix + 'c_q': e_q, prefix + 'c_k': e_k}
+        if e_gate is not None:
+            errors[prefix + 've_gate'] = e_gate
+        if not s.swap:
+            errors[prefix + 'c_q'] = None
+            errors[prefix + 'c_k'] = None
+        u = torch.zeros(b * t, WIDTH, device=self.device)
+        for site, error in errors.items():
+            if error is None:
+                gradients[site + '.weight'] = None
+                continue
+            gradients[site + '.weight'] = d.reassemble(site, error)
+            if site in (prefix + 'c_q', prefix + 'c_k'):
+                continue  # with the selection fixed, the attention output does not depend on the scores
+            w = d.modules[site].weight.float()  # (out, in): the gate reads the first channels of the stream
+            u[:, :w.shape[1]] += error.reshape(b * t, -1) @ w
+        if has_ve(i, L):
+            gradients[f'value_embeds.{i}.weight'] = d.reassemble(f'value_embeds.{i}', ve_error)
+        return u
+
     def cycle(self, fn, x, per_token, shared=()):
         """A full sign-flipped Hadamard cycle of moves of x (n, W), each scored by fn: the measured credit of x."""
         H = self.basis()
@@ -1342,6 +1464,8 @@ class Anvil(torch.optim.Optimizer):
         for group in self.param_groups:
             lr, wd = group['lr'], group['weight_decay']
             for p in group['params']:
+                if p.grad is None:
+                    continue
                 g = p.grad.float()
                 lanes = 1 if p.size(0) >= p.size(1) else 0
                 state = self.state[p]
@@ -1398,7 +1522,10 @@ def evaluate(model, rows, batch_size=16):
     total = torch.zeros(2, dtype=torch.float64, device=device)
     for batch in rows[rank::world].split(batch_size):
         batch = batch.to(device)
-        with torch.autocast('cuda', dtype=torch.bfloat16):
+        if CUDA:
+            with torch.autocast('cuda', dtype=torch.bfloat16):
+                loss = model(batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), loss_reduction='sum')
+        else:
             loss = model(batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), loss_reduction='sum')
         total[0] += loss.double()
         total[1] += batch[:, 1:].numel()
@@ -1411,6 +1538,12 @@ def load_split(path, rows=None):
     data = torch.load(path, map_location='cpu', weights_only=True).long()
     assert data.shape[1] == SEQ and (rows is None or data.shape[0] >= rows), (path, tuple(data.shape))
     return data if rows is None else data[:rows]
+
+
+def fake_data(config, rows, seq_len, seed):
+    """Random tokens, for smoke tests only."""
+    g = torch.Generator().manual_seed(seed + 7)
+    return torch.randint(0, config.vocab_size, (rows, seq_len + 1), generator=g)
 
 
 # ------------------------------------------------------------------------------------------------------------ train
@@ -1442,23 +1575,31 @@ def main():
     parser.add_argument('--steps', type=int, default=0, help='Smoke test: stop after this many updates.')
     parser.add_argument('--save-every', type=int, default=0, help='Save the weights every this many sequences '
                         '(analysis: credit structure along training).')
+    parser.add_argument('--ktop', type=int, default=64, help='Hard attention: keys per query.')
+    parser.add_argument('--no-swap', action='store_true', help='Freeze the hard attention internals (no q/k credit).')
+    parser.add_argument('--seq-len', type=int, default=2048, help='Model sequence length (fake data only).')
+    parser.add_argument('--fake-data', action='store_true', help='Random tokens, for smoke tests.')
+    parser.add_argument('--cpu', action='store_true', help='Run on CPU (smoke tests; disables compile).')
     args = parser.parse_args()
 
     rank, world = int(os.environ.get('RANK', 0)), int(os.environ.get('WORLD_SIZE', 1))
-    device = torch.device('cuda', int(os.environ.get('LOCAL_RANK', 0)))
-    torch.cuda.set_device(device)
+    device = torch.device('cpu') if args.cpu else torch.device('cuda', int(os.environ.get('LOCAL_RANK', 0)))
+    if not args.cpu:
+        torch.cuda.set_device(device)
     torch.set_float32_matmul_precision('high')
     if world > 1:
         torch.distributed.init_process_group('nccl', device_id=device)
     n_layer, WIDTH = PRESETS[args.preset]
     HIDDEN = 4 * WIDTH
-    config = GPTConfig(n_layer=n_layer, n_head=WIDTH // 64, n_kv_head=WIDTH // 64, n_embd=WIDTH)
+    config = GPTConfig(n_layer=n_layer, n_head=WIDTH // 64, n_kv_head=WIDTH // 64, n_embd=WIDTH,
+                       sequence_len=args.seq_len, ktop=args.ktop)
     recipe = Recipe()
     relay = args.estimator == 'relay'
     if args.switch is None:
         args.switch = 0.0 if relay else 0.3
     settings = Settings(fc_k=HIDDEN // 8, route_k=args.route_k or (HIDDEN // 4 if relay else HIDDEN // 16),
-                        cut_exact_keys=args.keys == 'exact', boost_exact_keys=args.boost_keys == 'exact')
+                        cut_exact_keys=args.keys == 'exact', boost_exact_keys=args.boost_keys == 'exact',
+                        swap=not args.no_swap)
     if args.boost_probes:
         settings.probes = args.boost_probes
     if args.chain_tokens:
@@ -1475,9 +1616,13 @@ def main():
         groups = [torch.distributed.new_group(list(range(g * split, (g + 1) * split))) for g in range(world // split)]
     group = groups[rank // split] if split > 1 else None
 
-    training = load_split(args.data_dir / args.train_file, args.train_rows)
+    if args.fake_data:
+        training = fake_data(config, max(args.train_rows, batch2 * 4), args.seq_len, args.seed)
+        val_rows = fake_data(config, 8, args.seq_len, args.seed + 1)
+    else:
+        training = load_split(args.data_dir / args.train_file, args.train_rows)
+        val_rows = load_split(args.data_dir / 'val.pt', VAL_ROWS)
     training = training[torch.randperm(len(training), generator=torch.Generator().manual_seed(SEED + 1))]
-    val_rows = load_split(args.data_dir / 'val.pt', VAL_ROWS)
     steps1, steps2 = len(training) // batch1, len(training) // batch2
     n1 = round(args.switch * steps1) // 2 * 2  # Boost updates, ending on a phase-2 batch boundary
     j0 = n1 * batch1 // batch2
@@ -1491,7 +1636,7 @@ def main():
         args.output.mkdir(parents=True, exist_ok=True)
         (args.output / 'config.json').write_text(json.dumps(dict(
             script=__file__, world=world, preset=args.preset, model=asdict(config), seed=args.seed,
-            estimator=args.estimator,
+            estimator=args.estimator, ktop=args.ktop, swap=settings.swap, fake_data=args.fake_data,
             switch=args.switch, boost_steps=n1, cut_steps=last - j0, boost_batch=batch1, cut_batch=batch2,
             train_file=args.train_file, train_rows=len(training), recipe=asdict(recipe), settings=asdict(settings),
             polar_margin=POLAR_MARGIN, torch_version=torch.__version__,
@@ -1502,7 +1647,8 @@ def main():
         return model, make_optimizer(model, recipe, steps1), Boost(model, settings, args.seed, rank, world, split, group)
 
     # untimed warmup on random tokens (compilation of both phases), then training from a fresh model
-    noise = torch.randint(0, config.vocab_size, (batch2, SEQ), generator=torch.Generator().manual_seed(SEED)).to(device)
+    noise = torch.randint(0, config.vocab_size, (batch2, args.seq_len + 1),
+                          generator=torch.Generator().manual_seed(SEED)).to(device)
     if n1:
         model, optimizer, estimator = boost_init()
         first = (rank // split) * per1
@@ -1514,17 +1660,19 @@ def main():
     Phase2 = dict(relay=Relay, cut=Cut, cutbi=CutBI, dfa=DFA)[args.estimator]
     estimator = Phase2(model, settings, args.seed, rank, world)
     mine = slice(rank * per2, (rank + 1) * per2)
-    estimator.step(noise[mine, :-1].contiguous(), noise[mine, 1:].contiguous(), optimizer)
-    estimator.close()
-    del model, optimizer, estimator
-    torch.cuda.empty_cache()
+    if not args.cpu:  # untimed warmup on random tokens (compilation), then training from a fresh state
+        estimator.step(noise[mine, :-1].contiguous(), noise[mine, 1:].contiguous(), optimizer)
+        estimator.close()
+        del model, optimizer, estimator
+        torch.cuda.empty_cache()
     model, optimizer, estimator = boost_init()
 
     if rank == 0:
         print(f'boostcut {args.preset}: Boost {n1} steps at batch {batch1}, Cut {last - j0} steps at batch {batch2}',
               flush=True)
     log = (args.output / 'metrics.jsonl').open('a') if rank == 0 else None
-    torch.cuda.synchronize()
+    if not args.cpu:
+        torch.cuda.synchronize()
     start, paused, elapsed = time.perf_counter(), 0.0, 0.0
 
     def set_rate(step, steps):
@@ -1535,7 +1683,8 @@ def main():
 
     def after(phase, step, seqs, loss):
         nonlocal paused, elapsed
-        torch.cuda.synchronize()
+        if not args.cpu:
+            torch.cuda.synchronize()
         elapsed = time.perf_counter() - start - paused
         record = dict(phase=phase, step=step, seqs=seqs, train_loss=loss, train_seconds=round(elapsed, 2))
         if args.eval_every and seqs % args.eval_every == 0 and seqs < len(training):

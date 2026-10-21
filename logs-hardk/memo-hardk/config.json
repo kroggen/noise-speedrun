@@ -1,0 +1,39 @@
+{
+  "script": "/root/noise/train/val/run_hardk.py",
+  "world": 1,
+  "preset": "2m",
+  "model": {
+    "n_layer": 2,
+    "n_head": 2,
+    "n_kv_head": 2,
+    "n_embd": 128,
+    "sequence_len": 512,
+    "ktop": 64
+  },
+  "seed": 0,
+  "estimator": "relay-hard",
+  "swap": true,
+  "batch": 4,
+  "train_rows": 64,
+  "recipe": {
+    "lr": 0.003,
+    "betas": [
+      0.7,
+      0.95
+    ],
+    "warmdown": 0.3,
+    "anvil_lr": 0.023,
+    "anvil_wd": 2.25
+  },
+  "settings": {
+    "sigma": 0.005,
+    "chain_sigma": 0.01,
+    "route_k": 128,
+    "fc_sigma": 0.05,
+    "chunk": 134217728,
+    "swap": true,
+    "margin_floor": 0.1
+  },
+  "fake_data": true,
+  "torch_version": "2.10.0+cu128"
+}

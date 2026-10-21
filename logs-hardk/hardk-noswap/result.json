@@ -1,0 +1,9 @@
+{
+  "val_loss": 4.971820747151094,
+  "train_seconds": 1185.01,
+  "steps": 610,
+  "batch": 8,
+  "ktop": 64,
+  "swap": false,
+  "tokens": 9989360
+}

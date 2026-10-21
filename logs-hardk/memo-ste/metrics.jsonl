@@ -1,0 +1,16 @@
+{"step": 1, "train_loss": 8.317779541015625, "train_seconds": 0.26}
+{"step": 2, "train_loss": 8.320160865783691, "train_seconds": 0.27}
+{"step": 3, "train_loss": 8.320955276489258, "train_seconds": 0.27}
+{"step": 4, "train_loss": 8.32036018371582, "train_seconds": 0.28}
+{"step": 5, "train_loss": 8.327478408813477, "train_seconds": 0.29}
+{"step": 6, "train_loss": 8.327391624450684, "train_seconds": 0.3}
+{"step": 7, "train_loss": 8.333281517028809, "train_seconds": 0.31}
+{"step": 8, "train_loss": 8.327980041503906, "train_seconds": 0.31, "val_loss": 8.331695556640625}
+{"step": 9, "train_loss": 8.324592590332031, "train_seconds": 0.32}
+{"step": 10, "train_loss": 8.334989547729492, "train_seconds": 0.33}
+{"step": 11, "train_loss": 8.3257474899292, "train_seconds": 0.34}
+{"step": 12, "train_loss": 8.325453758239746, "train_seconds": 0.35}
+{"step": 13, "train_loss": 8.333425521850586, "train_seconds": 0.35}
+{"step": 14, "train_loss": 8.336936950683594, "train_seconds": 0.36}
+{"step": 15, "train_loss": 8.338655471801758, "train_seconds": 0.37}
+{"step": 16, "train_loss": 8.334405899047852, "train_seconds": 0.38}
